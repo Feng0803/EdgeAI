@@ -50,6 +50,7 @@ static const KernelEntry kKernels[] = {
     {"reg2d_128x128x32_8x8",launch_reg2d<128, 128, 32, 8, 8>},
     {"custom_padA", launch_custom_padA<128, 128, 8, 8, 8>},  // Part 4: pad As by 1
     {"custom_padA_align16", launch_custom_padA_align16<128, 128, 8, 8, 8>}, // Part 4: 16-byte-aligned padded A
+    {"custom_padA_align16_swizzle8", launch_custom_padA_align16_swizzle8<128, 128, 8, 8, 8>}, // Part 4: CTA swizzle, GROUP_M=8
 };
 
 // =============================================================================
@@ -67,4 +68,5 @@ static const std::vector<const char*> kPart4Chain = {
     "reg2d_128x128x8_8x8",
     "custom_padA",
     "custom_padA_align16",
+    "custom_padA_align16_swizzle8",
 };
