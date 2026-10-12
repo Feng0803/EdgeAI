@@ -48,6 +48,7 @@ static const KernelEntry kKernels[] = {
     {"reg2d_64x64x16_4x4",launch_reg2d<64, 64, 16, 4, 4>},
     {"reg2d_128x64x16_8x4",    launch_reg2d<128, 64, 16, 8, 4>},
     {"reg2d_128x128x32_8x8",launch_reg2d<128, 128, 32, 8, 8>},
+    {"custom_padA", launch_custom_padA<128, 128, 8, 8, 8>},  // Part 4: pad As by 1
 };
 
 // =============================================================================
@@ -62,4 +63,6 @@ static const KernelEntry kKernels[] = {
 // =============================================================================
 #define HAS_PART4_CHAIN 1
 static const std::vector<const char*> kPart4Chain = {
+    "reg2d_128x128x8_8x8",
+    "custom_padA",
 };
