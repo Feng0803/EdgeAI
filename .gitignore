@@ -1,0 +1,16 @@
+/lab*/sgemm
+/lab*/ptxas_info.txt
+/lab*/logs/
+/lab*/reports/
+/lab*/results/
+/lab*/backups/
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.qdstrm
+*.tar.gz
+*.zip
+*.o
+*.so
+.env
+.env.*
