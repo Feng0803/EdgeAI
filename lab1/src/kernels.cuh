@@ -66,7 +66,6 @@ static const KernelEntry kKernels[] = {
 #define HAS_PART4_CHAIN 1
 static const std::vector<const char*> kPart4Chain = {
     "reg2d_128x128x8_8x8",
-    "custom_padA",
     "custom_padA_align16",
     "custom_padA_align16_swizzle8",
 };
