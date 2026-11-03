@@ -1,0 +1,14 @@
+# Local environments and generated outputs
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+artifacts/
+logs/
+results/
+history/
+*.pyc
+*.log
+*.pt
+*.pth
+*.safetensors
+*.zip
