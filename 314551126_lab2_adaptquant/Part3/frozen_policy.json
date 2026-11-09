@@ -1,0 +1,154 @@
+{
+  "method": "AdaptQuant reproduction with lab bit-budget adjustment",
+  "paper": "https://openreview.net/forum?id=ZGeR4gkEZq",
+  "reference_model": "unsloth/Llama-3.1-8B",
+  "reference_revision": "3f0d51f8e5640f98f1a96ea9044a0e55c0a83814",
+  "reference_data": "WikiText-2 train, first 2048 tokens",
+  "target_model_data_used": false,
+  "statistic": "log2(tile_absmax / tile_rms)",
+  "tile_shape": [
+    16,
+    32
+  ],
+  "grid_step": 0.02,
+  "reference_nvfp4_slack_db": 0.7,
+  "reference_bit_target": 5.17,
+  "scale_overhead_counted": true,
+  "five_byte_tile_metadata_counted": false,
+  "bit_accounting_rule": "TA clarification: MX scale overhead included; five-byte tile metadata excluded",
+  "reference_realized_bits": {
+    "weight": 4.977051923076923,
+    "activation": 5.350965105263159,
+    "realized_effective_bit_rate": 5.164008514170041
+  },
+  "weight": {
+    "q_proj": {
+      "t_mxfp4_to_mxfp6": 1.9,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 4.957994,
+      "fp6_tile_share": 0.353997,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 1048576
+    },
+    "k_proj": {
+      "t_mxfp4_to_mxfp6": 1.9,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.062798,
+      "fp6_tile_share": 0.406399,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 262144
+    },
+    "v_proj": {
+      "t_mxfp4_to_mxfp6": 1.84,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 4.90332,
+      "fp6_tile_share": 0.32666,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 262144
+    },
+    "o_proj": {
+      "t_mxfp4_to_mxfp6": 1.8,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 4.956177,
+      "fp6_tile_share": 0.353088,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 1048576
+    },
+    "gate_proj": {
+      "t_mxfp4_to_mxfp6": 1.88,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.107106,
+      "fp6_tile_share": 0.428553,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 3670016
+    },
+    "up_proj": {
+      "t_mxfp4_to_mxfp6": 1.8,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 4.903862,
+      "fp6_tile_share": 0.326931,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 3670016
+    },
+    "down_proj": {
+      "t_mxfp4_to_mxfp6": 1.8,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 4.930739,
+      "fp6_tile_share": 0.340369,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 3670016
+    }
+  },
+  "activation": {
+    "q_proj": {
+      "t_mxfp4_to_mxfp6": 2.32,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.405533,
+      "fp6_tile_share": 0.577766,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "k_proj": {
+      "t_mxfp4_to_mxfp6": 2.24,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.501381,
+      "fp6_tile_share": 0.62569,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "v_proj": {
+      "t_mxfp4_to_mxfp6": 2.38,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.330078,
+      "fp6_tile_share": 0.540039,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "o_proj": {
+      "t_mxfp4_to_mxfp6": 2.4,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.281139,
+      "fp6_tile_share": 0.51557,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "gate_proj": {
+      "t_mxfp4_to_mxfp6": 1.88,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.18029,
+      "fp6_tile_share": 0.465145,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "up_proj": {
+      "t_mxfp4_to_mxfp6": 1.88,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.18029,
+      "fp6_tile_share": 0.465145,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 524288
+    },
+    "down_proj": {
+      "t_mxfp4_to_mxfp6": 2.66,
+      "t_mxfp6_to_mxfp8": "CAP",
+      "element_and_scale_bits": 5.415845,
+      "fp6_tile_share": 0.582922,
+      "fp8_tile_share": 0.0,
+      "reference_layers": 32,
+      "reference_tiles": 1835008
+    }
+  }
+}
