@@ -32,6 +32,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--eval-only', action='store_true', help='requires previously generated checkpoints for all cases')
+    parser.add_argument('--search', action='store_true',
+                        help='rerun full candidate search instead of the submitted frozen allocations')
     args = parser.parse_args()
     if sys.version_info[:2] != (3,11) or torch.__version__ != '2.5.1+cu121':
         raise RuntimeError('Required base environment: Python 3.11, torch 2.5.1+cu121')
@@ -60,8 +62,11 @@ def main():
             command += ['--mode','mixed']
         if args.eval_only:
             command += ['--eval-only']
+        elif args.search:
+            command += ['--search']
         result_path.unlink(missing_ok=True)
-        print(f'[Part2] Case {case}: {"evaluate" if args.eval_only else "compress and evaluate"}; log: logs/case{case}.log',file=sys.stderr,flush=True)
+        action = 'evaluate' if args.eval_only else 'search, compress and evaluate' if args.search else 'frozen build and evaluate'
+        print(f'[Part2] Case {case}: {action}; log: logs/case{case}.log',file=sys.stderr,flush=True)
         with (logs/f'case{case}.log').open('w') as log:
             subprocess.run(command,cwd=cwd,stdout=log,stderr=subprocess.STDOUT,check=True)
         result = json.loads(result_path.read_text())
@@ -83,6 +88,7 @@ def main():
     if len({r['revision'] for r in results}) != 1:
         raise AssertionError('All cases must use the same original model revision')
     run.update(elapsed_seconds=time.monotonic()-started,cases=results,
+               allocation_mode='search' if args.search else 'eval-only' if args.eval_only else 'frozen',
                scope=results[0]['scope'], complete=True, all_cases_pass=True)
     (results_dir/'all_cases.json').write_text(json.dumps(run,indent=2)+'\n')
     for result in results:

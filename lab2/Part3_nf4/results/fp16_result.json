@@ -1,0 +1,18 @@
+{
+  "mode": "fp16",
+  "model": "Qwen/Qwen3-4B",
+  "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "ppl": 13.6378,
+  "adaptquant_assignment_reference_ppl": 13.98,
+  "ppl_difference_vs_reference": -0.34220000000000006,
+  "performance_score": null,
+  "evaluation_seconds": 363.7261589867994,
+  "evaluation_segments": 146,
+  "official_stdout": "base:\nppl: 13.6378\ncomp_rate: 0.00%\n------------------------\n",
+  "actual_weight_storage": "FP16",
+  "policy_sha256": null,
+  "evaluator_sha256": {
+    "run_eval.py": "d05ffd56d5a652d9ef81ecfd6da06d9388c05e1ea9b277de7a9a7f52ca31ea6e",
+    "evaluate.py": "a57c839b46e4c5babccb74e840fbb6e44e6be80cfd15d0aa372b72da4e24c441"
+  }
+}

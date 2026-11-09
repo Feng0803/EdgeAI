@@ -1,0 +1,39 @@
+{
+  "mode": "nf4",
+  "model": "Qwen/Qwen3-4B",
+  "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "ppl": 14.6759,
+  "adaptquant_assignment_reference_ppl": 13.98,
+  "ppl_difference_vs_reference": 0.6959,
+  "performance_score": 15,
+  "evaluation_seconds": 423.0019651968032,
+  "evaluation_segments": 146,
+  "official_stdout": "base:\nppl: 14.6759\ncomp_rate: 0.00%\n------------------------\n",
+  "actual_weight_storage": "FP16 fake-quantized values",
+  "actual_activation_execution": "FP16 tensors after fixed INT6 fake quantization",
+  "effective_bit_rate": {
+    "formula": "(weight_effective_bits + activation_effective_bits) / 2",
+    "scope": "252 decoder Linear weights and their input activations; embedding, lm_head, norms excluded",
+    "weight_values": 3633315840,
+    "weight_code_bits": 14533263360,
+    "weight_scale_count": 56770560,
+    "weight_scale_bits": 908328960,
+    "global_nf4_codebook_bits": 512,
+    "weight_total_bits": 15441592832,
+    "weight_effective_bits": 4.25000014091811,
+    "activation_values_per_token": 958464,
+    "activation_code_bits_per_token": 5750784,
+    "activation_scale_count_per_token": 14976,
+    "activation_scale_bits_per_token": 239616,
+    "activation_total_bits_per_token": 5990400,
+    "activation_effective_bits": 6.25,
+    "realized_effective_bit_rate": 5.2500000704590555,
+    "assignment_limit": 5.3,
+    "requirement_met": true
+  },
+  "policy_sha256": "83a3920f7f0b1080f16da9d7d8da4482c92875e585e7a262ca3565f79d5eecc0",
+  "evaluator_sha256": {
+    "run_eval.py": "d05ffd56d5a652d9ef81ecfd6da06d9388c05e1ea9b277de7a9a7f52ca31ea6e",
+    "evaluate.py": "a57c839b46e4c5babccb74e840fbb6e44e6be80cfd15d0aa372b72da4e24c441"
+  }
+}

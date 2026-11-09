@@ -4,6 +4,7 @@ import gc
 import hashlib
 import heapq
 import json
+from pathlib import Path
 import time
 
 from safetensors.torch import save_file
@@ -17,6 +18,7 @@ from pruning import (channel_importance, compensated_down_weight, cropped_mlp_mo
 
 
 MODEL_REVISION = '1cfa9a7208912126459214e8b04321603b3df60c'
+FROZEN_MANIFEST = Path(__file__).resolve().parents[1] / 'frozen' / 'case4_manifest.json'
 
 def candidate_path(args, index, width):
     return args.work_dir/'prune_candidates'/f'layer{index}.w{width}.pt'
@@ -125,6 +127,90 @@ def scan_pruning(args):
     return registry
 
 
+@torch.no_grad()
+def scan_pruning_frozen(args, frozen):
+    """Build only the submitted width for each of the 33 cropped MLP blocks."""
+    widths = {int(index):dict(row) for index,row in frozen['widths'].items()}
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=MODEL_REVISION)
+    batches, blocks = train_samples(tokenizer, args)
+    settings = dict(model=args.model,
+                    revision=AutoConfig.from_pretrained(args.model, revision=MODEL_REVISION)._commit_hash,
+                    samples=args.samples, holdout_samples=args.holdout_samples, seqlen=args.seqlen,
+                    widths=sorted(args.prune_widths), pruning_rate=args.pruning_rate,
+                    prune_damp=args.prune_damp, seed=args.seed, blocks=blocks,
+                    max_layers=args.max_layers, implementation='structured-prune-v1', scope=SCOPE)
+    fingerprint = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+    if fingerprint != frozen['pruning_fingerprint']:
+        raise ValueError('Current pruning settings do not match the submitted frozen allocation')
+    registry_path = args.work_dir/'frozen_pruning_scan.json'
+    expected = [candidate_path(args, index, row['width']) for index,row in widths.items()]
+    if registry_path.exists() and not args.rebuild and all(path.exists() for path in expected):
+        registry = json.loads(registry_path.read_text())
+        if registry.get('fingerprint') == fingerprint:
+            log('[prune-frozen] reusing fixed-width pruning candidates')
+            return registry
+    (args.work_dir/'prune_candidates').mkdir(parents=True, exist_ok=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model, revision=settings['revision'],
+                                                dtype=torch.float16, device_map={'': args.device})
+    model.eval().requires_grad_(False)
+    model.config.use_cache = False
+    original_specs = target_linear_specs(model)
+    hidden, kwargs = capture_first_inputs(model, batches[:args.samples])
+    del batches
+    rows = []
+    for index, layer in enumerate(model.model.layers):
+        started = time.monotonic()
+        row = widths.get(index)
+        mlp = layer.mlp
+        original = {name:getattr(mlp, name) for name in ('gate_proj', 'up_proj', 'down_proj')}
+        path = None if row is None else candidate_path(args, index, row['width'])
+        missing = row is not None and (args.rebuild or not path.exists())
+        gram = torch.zeros((mlp.gate_proj.out_features, mlp.gate_proj.out_features),
+                           device=args.device, dtype=torch.float32) if missing else None
+
+        def collect(module, inputs):
+            value = inputs[0].detach().reshape(-1, mlp.gate_proj.out_features).float()
+            gram.addmm_(value.T, value, beta=1, alpha=1/(args.samples*args.seqlen))
+
+        handle = mlp.down_proj.register_forward_pre_hook(collect) if missing else None
+        next_hidden = []
+        try:
+            for value in hidden:
+                next_hidden.append(layer(value, **kwargs).detach())
+        finally:
+            if handle is not None:
+                handle.remove()
+        if missing:
+            scores = channel_importance(original['down_proj'].weight, gram)
+            keep = keep_channels(scores, row['width'])
+            modules = cropped_mlp_modules(mlp, keep)
+            install_mlp_modules(mlp, modules)
+            if row['compensated']:
+                corrected = compensated_down_weight(original['down_proj'].weight, gram, keep,
+                                                     args.prune_damp)
+                mlp.down_proj = linear_from_weight(corrected, original['down_proj'].bias)
+            state = {name:cpu_tree(getattr(mlp, name).state_dict()) for name in original}
+            torch.save(dict(state=state, keep_indices=keep.int().cpu(), metrics=row), path)
+            install_mlp_modules(mlp, original)
+            del scores, keep, modules, state
+            if row['compensated']:
+                del corrected
+        if row is not None:
+            rows.append(row)
+        hidden = next_hidden
+        del next_hidden, gram
+        gc.collect()
+        torch.cuda.empty_cache()
+        log(f'[prune-frozen] block {index+1}/36 built ({time.monotonic()-started:.1f}s)')
+    registry = dict(fingerprint=fingerprint, settings=settings, original_specs=original_specs,
+                    rows=rows, allocation_mode='frozen')
+    registry_path.write_text(json.dumps(registry, indent=2))
+    del model, hidden, kwargs, original, mlp, layer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return registry
+
+
 def choose_widths(registry, args):
     grouped = {}
     for row in registry['rows']:
@@ -172,8 +258,8 @@ def choose_widths(registry, args):
 
 
 @torch.no_grad()
-def ensure_pruned(args, loader):
-    registry = scan_pruning(args)
+def ensure_pruned(args, loader, frozen=None):
+    registry = scan_pruning(args) if frozen is None else scan_pruning_frozen(args, frozen)
     output_dir = args.work_dir/'pruned'
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir/'manifest.json'
@@ -184,7 +270,9 @@ def ensure_pruned(args, loader):
                 saved.get('reload_check',{}).get('bitwise_equal_logits')):
             log('[prune] using verified saved FP16 pruned checkpoint')
             return saved
-    chosen = choose_widths(registry,args)
+    chosen = choose_widths(registry,args) if frozen is None else {
+        int(index):dict(row) for index,row in frozen['widths'].items()
+    }
     model = AutoModelForCausalLM.from_pretrained(args.model, revision=registry['settings']['revision'],
                                                 dtype=torch.float16, device_map={'': args.device})
     model.eval().requires_grad_(False)
@@ -203,7 +291,10 @@ def ensure_pruned(args, loader):
     manifest = dict(model=args.model,mode='pruned',calibration=registry['settings'],
                     pruning_fingerprint=registry['fingerprint'], original_specs=registry['original_specs'],
                     pruned_specs=pruned_specs,original_linear_bytes=before,compressed_linear_bytes=after,
-                    compression_rate=1-after/before, **accounting_metadata(registry['original_specs']), formats=formats,widths={str(i):r for i,r in chosen.items()},**counts)
+                    compression_rate=1-after/before, **accounting_metadata(registry['original_specs']),
+                    formats=formats,widths={str(i):r for i,r in chosen.items()},**counts,
+                    allocation_mode='search' if frozen is None else 'frozen',
+                    frozen_source=FROZEN_MANIFEST.name if frozen is not None else None)
     save_file({key:value.detach().cpu().contiguous() for key,value in model.state_dict().items()
                if key!='model.embed_tokens.weight'},str(output_dir/'model.safetensors'))
     manifest['checkpoint_file_bytes'] = (output_dir/'model.safetensors').stat().st_size

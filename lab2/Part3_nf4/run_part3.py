@@ -17,7 +17,8 @@ from zoneinfo import ZoneInfo
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from nf4 import POLICY, fake_quantize_decoder
+from nf4 import (POLICY, fake_quantize_decoder, install_activation_fake_quant,
+                 realized_effective_bit_rate)
 
 
 MODEL_ID = 'Qwen/Qwen3-4B'
@@ -77,7 +78,12 @@ def build_model(args, revision):
     if not shared_matrix_is_tied(model):
         raise AssertionError('Expected original tied embedding/lm_head')
     if args.mode == 'nf4':
-        log('[quantize] frozen policy: NF4 W4A16, block64, FP32 absmax; no calibration data/forwards')
+        bit_rate = realized_effective_bit_rate(model)
+        if not bit_rate['requirement_met']:
+            raise AssertionError(f'Effective bit-rate requirement failed: {bit_rate}')
+        manifest['effective_bit_rate'] = bit_rate
+        log('[quantize] frozen policy: NF4 W4A6, block64, FP16 scales; no calibration data/forwards')
+        log(f"[quantize] realized effective bit rate: {bit_rate['realized_effective_bit_rate']:.8f} <= 5.3")
 
         def forbidden_forward(module, inputs):
             raise RuntimeError('Model forwards are forbidden during weight-only quantization')
@@ -102,7 +108,11 @@ def build_model(args, revision):
                         quantized_weights=sum(row['weights'] for row in statistics),
                         weight_mse=sum(row['sse'] for row in statistics)/sum(row['weights'] for row in statistics),
                         quantization_seconds=time.monotonic()-started, layer_statistics=statistics)
-        log('[quantize] complete; all forwards and dataset access so far were unnecessary for quantization')
+        activation_count = install_activation_fake_quant(model, args.rows_per_chunk)
+        manifest.update(activation_quantized_linear_count=activation_count,
+                        activation_format='dynamic symmetric INT6 block64 with FP16 scale',
+                        activation_calibration_samples=0)
+        log('[quantize] complete; fixed A6 runtime hooks installed; no dataset or target-model forward was used to select the policy')
         # Officially allowed fake quantization: original architecture and FP16 storage.
         checkpoint = output_dir/'model'
         model.save_pretrained(checkpoint, safe_serialization=True, max_shard_size='3GB')
@@ -115,14 +125,18 @@ def build_model(args, revision):
         model = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float16, device_map={'': args.device})
         model.eval().requires_grad_(False)
         model.config.use_cache = False
+        restored_activation_count = install_activation_fake_quant(model, args.rows_per_chunk)
+        if restored_activation_count != manifest['activation_quantized_linear_count']:
+            raise AssertionError('Activation quantization scope changed after reload')
         actual = model(probe).logits.detach().cpu()
         if not torch.equal(reference, actual):
             raise AssertionError(f'Reload changed logits by {(reference.float()-actual.float()).abs().max().item()}')
         if not shared_matrix_is_tied(model):
             raise AssertionError('Original embedding/lm_head tying lost on reload')
         manifest['reload_check'] = dict(bitwise_equal_logits=True, tied_embedding_head=True,
+                                        activation_fake_quant_reinstalled=True,
                                         max_abs_difference=0.0)
-        log('[checkpoint] fake-quantized FP16 checkpoint reload passed: bitwise identical logits')
+        log('[checkpoint] W4A6 fake-quantized checkpoint reload passed: bitwise identical logits')
     (output_dir/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
     if args.mode == 'nf4':
         (HERE/'results/quantization_manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
@@ -141,6 +155,17 @@ def load_saved(args):
                                                 device_map={'': args.device})
     model.eval().requires_grad_(False)
     model.config.use_cache = False
+    actual_bit_rate = realized_effective_bit_rate(model)
+    saved_bit_rate = manifest['effective_bit_rate']
+    for key in ('weight_values', 'weight_scale_count', 'activation_values_per_token',
+                'activation_scale_count_per_token', 'realized_effective_bit_rate'):
+        if actual_bit_rate[key] != saved_bit_rate[key]:
+            raise AssertionError(f'Saved effective-bit accounting changed at {key}')
+    if not actual_bit_rate['requirement_met']:
+        raise AssertionError('Saved model no longer satisfies the 5.3-bit requirement')
+    activation_count = install_activation_fake_quant(model, args.rows_per_chunk)
+    if activation_count != manifest['activation_quantized_linear_count']:
+        raise AssertionError('Saved activation quantization scope changed')
     if not shared_matrix_is_tied(model):
         raise AssertionError('Embedding/head sharing lost')
     return model, manifest
@@ -184,11 +209,19 @@ def run_official_evaluation(model, manifest, args):
         hook.remove()
     ppl = float(re.search(r'^ppl: (\S+)$', captured.getvalue(), re.MULTILINE).group(1))
     print(f'Part3 {args.mode}\nPPL: {ppl:.4f}', flush=True)
+    if args.mode == 'nf4':
+        print(f"Realized Effective Bit Rate: {manifest['effective_bit_rate']['realized_effective_bit_rate']:.8f}",
+              flush=True)
     result = dict(mode=args.mode, model=MODEL_ID, revision=manifest['revision'], ppl=ppl,
                   adaptquant_assignment_reference_ppl=13.98, ppl_difference_vs_reference=ppl-13.98,
                   performance_score=performance_score(ppl) if args.mode == 'nf4' else None,
                   evaluation_seconds=time.monotonic()-started, evaluation_segments=segments,
-                  official_stdout=captured.getvalue(), actual_weight_storage='FP16',
+                  official_stdout=captured.getvalue(),
+                  actual_weight_storage=('FP16 fake-quantized values' if args.mode == 'nf4'
+                                         else 'original FP16 values'),
+                  actual_activation_execution=('FP16 tensors after fixed INT6 fake quantization'
+                                               if args.mode == 'nf4' else 'original FP16 path'),
+                  effective_bit_rate=manifest.get('effective_bit_rate'),
                   policy_sha256=manifest['policy_sha256'],
                   evaluator_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                                     for p in [runner, HERE/'evaluate.py']})

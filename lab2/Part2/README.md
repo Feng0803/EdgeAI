@@ -11,7 +11,17 @@ bash run.sh
 
 不需要先手動安裝套件。入口自動建立本地 `.venv`，從 `requirements.txt` 安裝依賴，依序完成四個 case 的校正、壓縮、保存／重載驗證與官方 PPL 評估。`bash 314551126_run.sh` 執行相同流程。若已有符合版本的環境，可指定 `PART2_PYTHON=/absolute/path/to/python bash run.sh`。
 
-基礎環境固定 Python 3.11、torch 2.5.1+cu121；其餘套件版本見 requirements。從原始模型建立校正候選需要較長時間；建議預留至少150GB暫存磁碟及30GB RAM。執行只使用指定的一張 GPU，不進行推論參數 offloading。
+預設入口使用 `frozen/` 中已驗證成功的配置，**不再搜尋要壓縮哪些 layers、bit-width、SVD ranks、INT8 rows 或 pruning widths**。程式仍會從原始模型與 calibration data 重建該固定配置所需的壓縮 tensors，之後執行官方 PPL；因此這不是直接印出舊結果，也不需要提交大型 checkpoint／候選快取。
+
+若要完整重現開發時的候選建立、誤差排序與 layer selection，才使用：
+
+```bash
+bash 314551126_run.sh --search
+```
+
+`--search` 會明顯花費更多時間與暫存空間。`frozen/*.json` 是預設重現流程所需的固定配置，屬於必要提交檔案。
+
+基礎環境固定 Python 3.11、torch 2.5.1+cu121；其餘套件版本見 requirements。完整 `--search` 從原始模型建立所有校正候選需要較長時間；建議預留至少150GB暫存磁碟及30GB RAM。預設 frozen 模式只建立最終配置需要的候選，所需時間與空間較少。執行只使用指定的一張 GPU，不進行推論參數 offloading。
 
 `stdout` 最後只印：
 
@@ -46,7 +56,7 @@ PPL: ...
 | 3 | activation-weighted SVD＋INT8／FP16 rows | SVD CR ≥20%、overall CR 50%（容許49.5%～50.5%）、PPL <50 |
 | 4 | 物理 MLP 剪枝＋packed GPTQ2／3＋NF4 head | 剪枝率 ≥20%、overall CR ≥85%、PPL <50 |
 
-四個案例都從相同原始 `Qwen/Qwen3-4B` commit `1cfa9a7208912126459214e8b04321603b3df60c` 開始。Case 4 的 GPTQ 使用重新收集的剪枝後統計；不把 Case 2 的模型或統計當作來源。校正與候選選擇只讀 WikiText-2 train，test 僅供最後正式評估。
+四個案例都從相同原始 `Qwen/Qwen3-4B` commit `1cfa9a7208912126459214e8b04321603b3df60c` 開始。Case 4 的 GPTQ 使用重新收集的剪枝後統計；不把 Case 2 的模型或統計當作來源。開發／搜尋時的校正與候選選擇只讀 WikiText-2 train，test 僅供最後正式評估。預設 frozen 模式同樣只以 train 重建已固定的量化參數，不用 test 重新挑選配置。
 
 Case 1：32×512 fit、4×512 holdout tokens，group128、1% damping，候選為 MLP projections；其餘 Linear NF4＋double quant。Case 2：64×1024 fit、8×1024 holdout，group256、act-order、1% damping，依 block 輸出誤差增量／實際節省 bytes 配置 INT2／3。
 
@@ -74,6 +84,7 @@ INT2 每4個 codes 存1 byte，INT3 每8個 codes 存3 bytes。推論僅暫時�
 
 - `results/caseN_result.json`：正式 PPL、CR、門檻與儲存檢查。
 - `results/caseN_manifest.json`：模型來源、校正設定、精度／rank／寬度配置、重載結果。
+- `frozen/caseN_manifest.json`：四組已驗證配置；預設入口據此直接重建最終模型，不執行配置搜尋。
 - `artifacts/caseN/`：可重建的候選快取及最終 checkpoint；case1 直接存於此處，case2～4 最終模型在其 `mixed/` 子目錄。
 - `caseN/`：各 case 的完整實作與原始 evaluator；單獨執行方式見各 case 的 README。
 
@@ -85,7 +96,7 @@ INT2 每4個 codes 存1 byte，INT3 每8個 codes 存3 bytes。推論僅暫時�
 bash run.sh --eval-only
 ```
 
-若模型、資料已快取，可設定 `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`。中斷後再次執行相同命令會重用已完成且 fingerprint 相同的校正候選，並重新建立最終 checkpoint／重跑 PPL。個別 case 程式支援 `--work-dir`；修改校正參數時請透過該參數指定新的工作目錄，以免混用統計。
+若模型、資料已快取，可設定 `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`。中斷後再次執行相同命令會重用已完成且 fingerprint 相同的固定配置候選，並重新建立最終 checkpoint／重跑 PPL。個別 case 程式支援 `--work-dir`；修改校正參數或執行新的 `--search` 實驗時，請透過該參數指定新的工作目錄，以免混用統計。
 
 提交包保留完成的 PDF 報告及重現程式。執行入口負責壓縮、官方評估，並在 `results/` 產生實測 JSON。
 

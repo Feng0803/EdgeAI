@@ -34,9 +34,17 @@ from gptq_lowbit import (PackedLowBitLinear, SharedNF4Embedding, candidate_modul
 
 
 MODEL_REVISION = '1cfa9a7208912126459214e8b04321603b3df60c'
+FROZEN_MANIFEST = Path(__file__).resolve().parents[1] / 'frozen' / 'case4_manifest.json'
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def load_frozen_manifest(args):
+    manifest = json.loads(FROZEN_MANIFEST.read_text())
+    if manifest['model'] != args.model or manifest['calibration']['revision'] != MODEL_REVISION:
+        raise ValueError('Frozen Case 4 allocation does not match the requested model revision')
+    return manifest
 
 
 def checkpoint_dir(args):
@@ -64,6 +72,8 @@ def parse_args():
     parser.add_argument("--score", choices=["block", "projection"], default="block")
     parser.add_argument("--protect", nargs="*", default=[], help="decoder Linear names to retain at NF4")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--search", action="store_true",
+                        help="rerun pruning-width and INT2/INT3 search instead of submitted allocations")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--skip-eval", action="store_true")
     args = parser.parse_args()
@@ -231,7 +241,123 @@ def scan(args):
 
 
 @torch.no_grad()
+def scan_frozen(args):
+    """Build one predetermined GPTQ candidate for every physically pruned Linear."""
+    frozen = load_frozen_manifest(args)
+    int2 = {row['name'] for row in frozen['selected']}
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=MODEL_REVISION)
+    batches, blocks = train_samples(tokenizer, args)
+    prune_manifest = json.loads((args.work_dir/'pruned/manifest.json').read_text())
+    settings = dict(model=args.model,
+                    revision=AutoConfig.from_pretrained(args.model, revision=MODEL_REVISION)._commit_hash,
+                    samples=args.samples, holdout_samples=args.holdout_samples,
+                    seqlen=args.seqlen, group_size=args.group_size, damp=args.damp,
+                    act_order=args.act_order, seed=args.seed, blocks=blocks,
+                    max_layers=args.max_layers, implementation='case4-pruned-gptq-v1',
+                    pruning_fingerprint=prune_manifest['pruning_fingerprint'])
+    allocation_hash = hashlib.sha256(json.dumps(sorted(int2)).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps(dict(settings=settings, allocation=allocation_hash),
+                                               sort_keys=True).encode()).hexdigest()
+    scan_dir = args.work_dir/'candidates'
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    registry_path = args.work_dir/'frozen_scan.json'
+    if registry_path.exists() and not args.rebuild:
+        registry = json.loads(registry_path.read_text())
+        paths_ok = all(candidate_path(args, row['name'], row['bits']).exists()
+                       for row in registry.get('rows', []))
+        if registry.get('fingerprint') == fingerprint and paths_ok:
+            log('[frozen] reusing completed pruned fixed-bit GPTQ scan')
+            return registry
+    log('[frozen] computing one predetermined GPTQ candidate per pruned Linear')
+    model = load_checkpoint(args, mode='pruned')
+    model.eval().requires_grad_(False)
+    model.config.use_cache = False
+    pruned_specs = target_linear_specs(model)
+    specs = prune_manifest['original_specs']
+    hidden, kwargs = capture_first_inputs(model, batches[:args.samples])
+    del batches
+    rows = []
+    for index, layer in enumerate(model.model.layers):
+        started = time.monotonic()
+        modules = {name:module for name,module in layer.named_modules()
+                   if isinstance(module, torch.nn.Linear)}
+        names = {name:f'model.layers.{index}.{name}' for name in modules}
+        missing = [name for name in modules
+                   if args.rebuild or not candidate_path(args, names[name], 2 if names[name] in int2 else 3).exists()]
+        grams, handles = {}, []
+
+        def family(name):
+            suffix = name.rsplit('.', 1)[-1]
+            if suffix in ('gate_proj', 'up_proj'):
+                return 'mlp_input'
+            if suffix in ('q_proj', 'k_proj', 'v_proj'):
+                return 'attn_input'
+            return name
+
+        for name in missing:
+            key = family(name)
+            if key in grams:
+                continue
+            grams[key] = torch.zeros((modules[name].in_features, modules[name].in_features),
+                                     device=args.device, dtype=torch.float32)
+
+            def collect(module, inputs, key=key):
+                value = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).float()
+                grams[key].addmm_(value.T, value, beta=1,
+                                  alpha=1/(args.samples*args.seqlen))
+
+            handles.append(modules[name].register_forward_pre_hook(collect))
+        next_hidden = []
+        try:
+            for value in hidden:
+                next_hidden.append(layer(value, **kwargs).detach())
+        finally:
+            for handle in handles:
+                handle.remove()
+        for name, module in modules.items():
+            full_name = names[name]
+            bits = 2 if full_name in int2 else 3
+            path = candidate_path(args, full_name, bits)
+            if path.exists() and not args.rebuild:
+                payload = torch.load(path, map_location='cpu', weights_only=True)
+                metrics = dict(payload['metrics'])
+                del payload
+            else:
+                candidate = quantize_gptq(module.weight, grams[family(name)], bits,
+                                          args.group_size, args.damp, args.act_order)
+                if module.bias is not None:
+                    candidate.bias = module.bias.detach().clone()
+                metrics = dict(name=full_name, bits=bits,
+                               packed_bytes=module_payload(candidate))
+                torch.save(dict(spec=candidate.spec(), state=cpu_tree(candidate.state_dict()),
+                                metrics=metrics), path)
+                del candidate
+            metrics['name'] = full_name
+            metrics['bits'] = bits
+            rows.append(metrics)
+        hidden = next_hidden
+        del next_hidden, grams
+        gc.collect()
+        torch.cuda.empty_cache()
+        log(f'[frozen] pruned layer {index+1}/36 built ({time.monotonic()-started:.1f}s)')
+    registry = dict(fingerprint=fingerprint, settings=settings, original_specs=specs,
+                    pruned_specs=pruned_specs, pruning_rate=prune_manifest['pruning_rate'],
+                    pruning_fingerprint=prune_manifest['pruning_fingerprint'],
+                    widths=prune_manifest['widths'], rows=rows, allocation_mode='frozen',
+                    int2_layers=sorted(int2))
+    registry_path.write_text(json.dumps(registry, indent=2))
+    del model, hidden, kwargs, modules
+    gc.collect()
+    torch.cuda.empty_cache()
+    return registry
+
+
+@torch.no_grad()
 def build(args, registry):
+    # Some names are assigned only while searching.  Initialise them so the
+    # common checkpoint-reload cleanup also works with a frozen allocation.
+    module = payload = layer = None
+    frozen = None if args.search else load_frozen_manifest(args)
     output_dir = checkpoint_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     model = load_checkpoint(args, mode='pruned')
@@ -243,55 +369,69 @@ def build(args, registry):
     by_name = {}
     for row in registry["rows"]:
         by_name.setdefault(row["name"], {})[row["bits"]] = row
-    for name in by_name:
-        if name in args.protect:
-            source = model.get_submodule(name)
-            protected = bnb.nn.Linear4bit(source.in_features,source.out_features,bias=source.bias is not None,
-                                          compute_dtype=torch.float16,compress_statistics=True,quant_type='nf4')
-            protected.weight = bnb.nn.Params4bit(source.weight.detach(),requires_grad=False,
-                                                  compress_statistics=True,quant_type='nf4')
-            if source.bias is not None:
-                protected.bias = torch.nn.Parameter(source.bias.detach().clone(),requires_grad=False)
-            set_module(model,name,protected.to(args.device))
-            continue
-        payload = torch.load(candidate_path(args, name, 3), map_location="cpu", weights_only=True)
-        set_module(model, name, candidate_module(payload, args.device))
-    after = target_payload(model, specs)
-    log(f"[storage] decoder-3bit baseline: {before:,} -> {after:,} bytes ({1-after/before:.6%})")
-    ranking = []
-    for name, values in by_name.items():
-        if name in args.protect:
-            continue
-        saving = values[3]["packed_bytes"]-values[2]["packed_bytes"]
-        delta = values[2]["block_delta"] if args.score == "block" else values[2]["output_error"]-values[3]["output_error"]
-        ranking.append(dict(name=name, saved_bytes=saving, delta_error=delta,
-                            score=delta/saving, error2=values[2]["output_error"], error3=values[3]["output_error"]))
-    ranking.sort(key=lambda row: row["score"])
-    selected = []
-    if args.mode == "mixed":
-        for row in ranking:
-            if 1-after/before >= args.target_rate:
-                break
-            payload = torch.load(candidate_path(args, row["name"], 2), map_location="cpu", weights_only=True)
-            set_module(model, row["name"], candidate_module(payload, args.device))
-            after -= row["saved_bytes"]
-            selected.append(row)
-            log(f"[select] {row['name']} b2: delta={row['delta_error']:.6g}, rate={1-after/before:.6%}")
+    if frozen is not None:
+        for name, values in by_name.items():
+            bits = next(iter(values))
+            payload = torch.load(candidate_path(args, name, bits), map_location='cpu', weights_only=True)
+            set_module(model, name, candidate_module(payload, args.device))
+        after = target_payload(model, specs)
+        ranking = frozen['ranking']
+        selected = frozen['selected']
+        block_errors = frozen['joint_block_errors']
+        if after != frozen['compressed_linear_bytes']:
+            raise AssertionError(f"Frozen Case 4 payload changed: {after} != {frozen['compressed_linear_bytes']}")
+        log(f'[storage] frozen pruned INT2/INT3 allocation: {before:,} -> {after:,} bytes ({1-after/before:.6%})')
+    else:
+        for name in by_name:
+            if name in args.protect:
+                source = model.get_submodule(name)
+                protected = bnb.nn.Linear4bit(source.in_features,source.out_features,bias=source.bias is not None,
+                                              compute_dtype=torch.float16,compress_statistics=True,quant_type='nf4')
+                protected.weight = bnb.nn.Params4bit(source.weight.detach(),requires_grad=False,
+                                                      compress_statistics=True,quant_type='nf4')
+                if source.bias is not None:
+                    protected.bias = torch.nn.Parameter(source.bias.detach().clone(),requires_grad=False)
+                set_module(model,name,protected.to(args.device))
+                continue
+            payload = torch.load(candidate_path(args, name, 3), map_location="cpu", weights_only=True)
+            set_module(model, name, candidate_module(payload, args.device))
+        after = target_payload(model, specs)
+        log(f"[storage] decoder-3bit baseline: {before:,} -> {after:,} bytes ({1-after/before:.6%})")
+        ranking = []
+        for name, values in by_name.items():
+            if name in args.protect:
+                continue
+            saving = values[3]["packed_bytes"]-values[2]["packed_bytes"]
+            delta = values[2]["block_delta"] if args.score == "block" else values[2]["output_error"]-values[3]["output_error"]
+            ranking.append(dict(name=name, saved_bytes=saving, delta_error=delta,
+                                score=delta/saving, error2=values[2]["output_error"], error3=values[3]["output_error"]))
+        ranking.sort(key=lambda row: row["score"])
+        selected = []
+        if args.mode == "mixed":
+            for row in ranking:
+                if 1-after/before >= args.target_rate:
+                    break
+                payload = torch.load(candidate_path(args, row["name"], 2), map_location="cpu", weights_only=True)
+                set_module(model, row["name"], candidate_module(payload, args.device))
+                after -= row["saved_bytes"]
+                selected.append(row)
+                log(f"[select] {row['name']} b2: delta={row['delta_error']:.6g}, rate={1-after/before:.6%}")
     measured = target_payload(model, specs)
     if measured != after:
         raise AssertionError("Storage bookkeeping mismatch")
     # Validate combined choices on complete blocks, using TRAIN holdout only.
-    block_errors = {}
-    for index, layer in enumerate(model.model.layers):
-        path = args.work_dir / "blocks" / f"layer{index}.pt"
-        if not path.exists():
-            continue
-        holdout = device_tree(torch.load(path, map_location="cpu", weights_only=True), args.device)
-        error = block_error(layer, holdout["inputs"], holdout["references"], holdout["kwargs"])
-        baseline = json.loads(path.with_suffix(".json").read_text())["baseline3_error"]
-        block_errors[index] = dict(baseline3=baseline, selected=error, increase=error-baseline)
-        log(f"[joint-block] {index}: E={error:.6g}, baseline3={baseline:.6g}")
-        del holdout
+    if frozen is None:
+        block_errors = {}
+        for index, layer in enumerate(model.model.layers):
+            path = args.work_dir / "blocks" / f"layer{index}.pt"
+            if not path.exists():
+                continue
+            holdout = device_tree(torch.load(path, map_location="cpu", weights_only=True), args.device)
+            error = block_error(layer, holdout["inputs"], holdout["references"], holdout["kwargs"])
+            baseline = json.loads(path.with_suffix(".json").read_text())["baseline3_error"]
+            block_errors[index] = dict(baseline3=baseline, selected=error, increase=error-baseline)
+            log(f"[joint-block] {index}: E={error:.6g}, baseline3={baseline:.6g}")
+            del holdout
     formats = {}
     for name in specs:
         module = model.get_submodule(name)
@@ -306,7 +446,9 @@ def build(args, registry):
                     calibration=registry["settings"], score=args.score, protect=args.protect,
                     selected=selected, ranking=ranking, joint_block_errors=block_errors,
                     pruning_rate=registry['pruning_rate'], pruned_specs=registry['pruned_specs'],
-                    pruning_fingerprint=registry['pruning_fingerprint'],widths=registry['widths'])
+                    pruning_fingerprint=registry['pruning_fingerprint'],widths=registry['widths'],
+                    allocation_mode='search' if args.search else 'frozen',
+                    frozen_source=FROZEN_MANIFEST.name if frozen is not None else None)
     checkpoint = output_dir / "model.safetensors"
     save_file({key: value.detach().cpu().contiguous() for key, value in model.state_dict().items()}, str(checkpoint))
     manifest["checkpoint_file_bytes"] = checkpoint.stat().st_size
@@ -438,14 +580,17 @@ def main():
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    frozen = None if args.search else load_frozen_manifest(args)
+    if not args.search and not args.eval_only and (args.mode != 'mixed' or args.protect or args.max_layers is not None):
+        raise ValueError('Frozen Case 4 supports the submitted mixed mode only; use --search for custom experiments')
     if args.eval_only:
         model = load_checkpoint(args)
     else:
-        ensure_pruned(args,load_checkpoint)
+        ensure_pruned(args,load_checkpoint,frozen)
         if args.mode == 'pruned':
             model = load_checkpoint(args,mode='pruned')
         else:
-            registry = scan(args)
+            registry = scan(args) if args.search else scan_frozen(args)
             model = build(args, registry)
     if not args.skip_eval:
         run_official_evaluation(model, args)

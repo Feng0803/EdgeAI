@@ -1,19 +1,22 @@
-# 314551126 · Lab 2 提交檔案
+# Lab 2 — 314551126
 
-本目錄是準備繳交的內容，依作業格式分為 `Part1/`、`Part2/`、`Part3/`。
+本目錄整理 Lab 2 的完整實作、報告與兩種 Part 3 版本。
 
-| 部分 | 主要檔案 | 重現入口 |
-|---|---|---|
-| Part 1 | `Part1/314551126_Part1.ipynb` | 在 Kaggle／Colab 準備 GPU 與指定模型權重後執行 Notebook；依平台設定模型路徑 |
-| Part 2 | `Part2/314551126_report.pdf` | 在 Part2 執行 `bash run.sh` 或 `bash 314551126_run.sh` |
-| Part 3 | `Part3/314551126_report.pdf` | 在 Part3 執行 `bash run.sh` |
+## 目錄
 
-Part 1 使用 torch 2.6.0；Part 2/3 使用 Python 3.11、torch 2.5.1+cu121，環境各自隔離。Part 2/3 都只需要一張 T4 等級 GPU；首次需要網路下載 Qwen3-4B、WikiText-2 及依賴。Part 2／3 的詳細環境與命令見各自的 README。
+- `Part1/`：量化作業 Notebook。
+- `Part2/`：四個 LLM compression cases；正式入口為
+  `bash 314551126_run.sh`，預設使用 `frozen/` 中已驗證的配置。
+- `Part3/`：目前正式的 AdaptQuant-based calibration-free PTQ 版本；
+  正式入口為 `bash run.sh`。
+- `Part3_nf4/`：先前完成的 calibration-free NF4 W4A16 版本，保留作為
+  baseline、結果比較與實作紀錄；入口同樣為 `bash run.sh`。
+- `26502_AdaptQuant_Hardware_Alig.pdf`：Part 3 參考論文。
 
-Part 2 的 `run.sh` 自動安裝依賴、從原始模型壓縮四個 cases、使用提供的 evaluator 評估，stdout 僅印四組 Compression Ratio／PPL；進度與日誌另外記錄。包含兩個 shell 檔名是為了同時符合題目內文 `run.sh` 與總提交清單 `StudentID_run.sh` 的要求。
+各部分的環境、方法、固定設定來源與重現方式，詳見各自的 README。
+大型模型 checkpoint、虛擬環境與執行期間產物不納入版本控制。
 
-Part 1 僅保留 Notebook，執行時另行提供題目指定的 MobileNetV2 權重。Part 2／3 保留壓縮與評估程式及已完成的 PDF 報告；重新執行後會產生結果 JSON、配置與 checkpoint。
+## 作業繳交版本
 
-大型 Qwen checkpoint 與校正候選由執行入口重建，不依賴本 workspace 的其他實驗資料夾。
-
-2026-11-03 更新：Part 2 壓縮率及剪枝率均排除 lm_head；四個案例達標。Case 3 重建並完整重測，壓縮率精確50%、SVD壓縮率22.2727%、PPL25.7291。四個 case 均已在目前提交程式上完成重新壓縮與正式評估，數值與報告一致。Part 2 報告與比較表亦已同步。
+正式繳交內容使用 `Part1/`、`Part2/` 與 `Part3/`。`Part3_nf4/` 與論文
+留在 GitHub 作為替代方法及開發紀錄，不放入最終繳交 ZIP。

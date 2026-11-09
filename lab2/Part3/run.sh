@@ -11,7 +11,10 @@ else
     part3_python=.venv/bin/python
 fi
 
-"$part3_python" -c 'import sys; assert sys.version_info[:2] == (3,11), "Python 3.11 required"'
+"$part3_python" -c 'import sys; assert sys.version_info[:2] == (3, 11), "Python 3.11 required"'
 "$part3_python" -m pip install -r requirements.txt >&2
-"$part3_python" -u run_part3.py --mode fp16
-"$part3_python" -u run_part3.py --mode nf4 "$@"
+"$part3_python" test_adaptquant.py >&2
+
+# Default grading path: load the frozen reference-model policy and apply it
+# directly.  No threshold derivation or target-model search is performed.
+"$part3_python" -u run_adaptquant.py "$@"

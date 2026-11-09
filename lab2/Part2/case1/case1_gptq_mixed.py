@@ -35,9 +35,17 @@ from gptq_mixed import (Packed3BitLinear, SharedNF4Embedding, install_shared_nf4
 
 
 MODEL_REVISION = '1cfa9a7208912126459214e8b04321603b3df60c'
+FROZEN_MANIFEST = Path(__file__).resolve().parents[1] / 'frozen' / 'case1_manifest.json'
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def load_frozen_manifest(args):
+    manifest = json.loads(FROZEN_MANIFEST.read_text())
+    if manifest['model'] != args.model or manifest['calibration']['revision'] != MODEL_REVISION:
+        raise ValueError('Frozen Case 1 allocation does not match the requested model revision')
+    return manifest
 
 
 def parse_args():
@@ -57,6 +65,8 @@ def parse_args():
     parser.add_argument("--work-dir", type=Path, default=Path(__file__).parent / "artifacts/case1_gptq")
     parser.add_argument("--max-layers", type=int, default=None, help="limit scan for a smoke test only")
     parser.add_argument("--rebuild", action="store_true", help="ignore existing scan candidates")
+    parser.add_argument("--search", action="store_true",
+                        help="rerun full layer search instead of the submitted 25-layer allocation")
     parser.add_argument("--eval-only", action="store_true", help="reload saved packed model and run official evaluation")
     parser.add_argument("--skip-eval", action="store_true", help="build and verify checkpoint only")
     args = parser.parse_args()
@@ -108,6 +118,9 @@ def capture_first_inputs(model, batches):
 
 @torch.no_grad()
 def scan(args):
+    frozen = None if args.search else load_frozen_manifest(args)
+    frozen_names = set() if frozen is None else {row['name'] for row in frozen['selected']}
+    frozen_rows = {} if frozen is None else {row['name']: row for row in frozen['selected']}
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=MODEL_REVISION)
     batches, blocks = train_samples(tokenizer, args)
     fingerprint_data = dict(model=args.model, revision=AutoConfig.from_pretrained(args.model, revision=MODEL_REVISION)._commit_hash,
@@ -135,7 +148,8 @@ def scan(args):
             break
         t0 = time.monotonic()
         modules = {name: module for name, module in layer.named_modules()
-                   if name.rsplit(".", 1)[-1] in args.targets}
+                   if name.rsplit(".", 1)[-1] in args.targets and
+                   (args.search or f"model.layers.{index}.{name}" in frozen_names)}
         paths = {name: scan_dir / (f"model.layers.{index}.{name}.pt") for name in modules}
         missing = [name for name in modules if args.rebuild or not paths[name].exists()]
         grams, heldout = {}, {}
@@ -160,7 +174,7 @@ def scan(args):
                 if sample_index < args.samples:
                     xf = x.float()
                     grams[key].addmm_(xf.T, xf, beta=1, alpha=1 / (args.samples * args.seqlen))
-                else:
+                elif args.search:
                     # Uniformly subsample fit-independent tokens for output reconstruction.
                     heldout[key].append(x[::max(1, x.shape[0] // 128)].clone())
 
@@ -184,15 +198,19 @@ def scan(args):
             start = time.monotonic()
             key = family(name)
             candidate = quantize_gptq3(module.weight, grams[key], args.group_size, args.damp)
-            error3, error4 = reconstruction_errors(module.weight, candidate, torch.cat(heldout[key]))
+            if args.search:
+                error3, error4 = reconstruction_errors(module.weight, candidate, torch.cat(heldout[key]))
+                metrics = dict(name=full_name, error3=error3, error4=error4,
+                               delta_error=error3-error4, packed_bytes=module_payload(candidate))
+            else:
+                metrics = dict(frozen_rows[full_name])
+                metrics['packed_bytes'] = module_payload(candidate)
             if module.bias is not None:
                 candidate.bias = module.bias.detach().clone()
-            metrics = dict(name=full_name, error3=error3, error4=error4,
-                           delta_error=error3-error4, packed_bytes=module_payload(candidate))
             torch.save(dict(spec=candidate.spec(), state={k: v.cpu() for k, v in candidate.state_dict().items()},
                             metrics=metrics), paths[name])
             rows.append(metrics)
-            log(f"[candidate] {full_name}: E3={error3:.6g} E4={error4:.6g} delta={error3-error4:.6g}, {time.monotonic()-start:.1f}s")
+            log(f"[candidate] {full_name}: GPTQ3 built for {'search' if args.search else 'frozen allocation'}, {time.monotonic()-start:.1f}s")
             del candidate
         log(f"[scan] layer {index+1}/{len(model.model.layers)} done in {time.monotonic()-t0:.1f}s")
         del grams, heldout, next_hidden
@@ -212,6 +230,7 @@ def candidate_module(payload, device):
 
 @torch.no_grad()
 def build(args, specs, rows, settings):
+    frozen = None if args.search else load_frozen_manifest(args)
     cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                             bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16,
@@ -222,22 +241,26 @@ def build(args, specs, rows, settings):
     baseline_bytes = target_payload(model, specs)
     before = original_bytes(specs)
     after = baseline_bytes
-    ranking = []
-    for row in rows:
-        saving = module_payload(model.get_submodule(row["name"])) - row["packed_bytes"]
-        if saving > 0:
-            ranking.append(dict(**row, saved_bytes=saving, score=row["delta_error"] / saving))
-    ranking.sort(key=lambda row: row["score"])
+    ranking = [] if frozen is None else frozen['ranking']
+    if frozen is None:
+        for row in rows:
+            saving = module_payload(model.get_submodule(row["name"])) - row["packed_bytes"]
+            if saving > 0:
+                ranking.append(dict(**row, saved_bytes=saving, score=row["delta_error"] / saving))
+        ranking.sort(key=lambda row: row["score"])
     selected = []
     log(f"[storage] baseline decoder Linear packed NF4: {before:,} -> {after:,} bytes ({1-after/before:.6%})")
-    for row in ranking:
-        if 1 - after / before >= args.target_rate:
+    choices = ranking if frozen is None else frozen['selected']
+    for row in choices:
+        if frozen is None and 1 - after / before >= args.target_rate:
             break
         payload = torch.load(args.work_dir / "candidates" / (row["name"] + ".pt"), map_location="cpu", weights_only=True)
         set_module(model, row["name"], candidate_module(payload, args.device))
-        after -= row["saved_bytes"]
+        after = target_payload(model, specs)
         selected.append(row)
         log(f"[select] {row['name']}: delta={row['delta_error']:.6g} saving={row['saved_bytes']:,}, rate={1-after/before:.6%}")
+    if frozen is not None and after != frozen['compressed_linear_bytes']:
+        raise AssertionError(f"Frozen Case 1 payload changed: {after} != {frozen['compressed_linear_bytes']}")
     measured = target_payload(model, specs)
     if measured != after:
         raise AssertionError(f"Storage accounting mismatch: {measured} != {after}")
@@ -250,7 +273,9 @@ def build(args, specs, rows, settings):
                     compression_rate=1-after/before, target_rate=args.target_rate,
                     target_met=1-after/before >= args.target_rate,
                     **accounting_metadata(specs),
-                    calibration=settings, selected=selected, ranking=ranking)
+                    calibration=settings, selected=selected, ranking=ranking,
+                    allocation_mode='search' if args.search else 'frozen',
+                    frozen_source=str(FROZEN_MANIFEST.name) if frozen is not None else None)
     checkpoint = args.work_dir / "model.safetensors"
     save_file({key: value.detach().cpu().contiguous() for key, value in model.state_dict().items()}, str(checkpoint))
     manifest["checkpoint_file_bytes"] = checkpoint.stat().st_size

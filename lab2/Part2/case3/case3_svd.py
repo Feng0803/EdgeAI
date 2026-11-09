@@ -31,9 +31,17 @@ from svd_linear import (LowRankLinear, RowMixedLinear, allocate_int8_rows, apply
 
 
 MODEL_REVISION = '1cfa9a7208912126459214e8b04321603b3df60c'
+FROZEN_MANIFEST = Path(__file__).resolve().parents[1] / 'frozen' / 'case3_manifest.json'
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def load_frozen_manifest(args):
+    manifest = json.loads(FROZEN_MANIFEST.read_text())
+    if manifest['model'] != args.model or manifest['calibration']['revision'] != MODEL_REVISION:
+        raise ValueError('Frozen Case 3 allocation does not match the requested model revision')
+    return manifest
 
 
 def checkpoint_dir(args):
@@ -57,6 +65,8 @@ def parse_args():
     parser.add_argument('--max-layers', type=int, default=None, help='smoke test only')
     parser.add_argument('--work-dir', type=Path, default=Path(__file__).parent/'artifacts/weighted')
     parser.add_argument('--rebuild', action='store_true')
+    parser.add_argument('--search', action='store_true',
+                        help='rerun SVD rank and INT8-row search instead of the submitted allocation')
     parser.add_argument('--eval-only', action='store_true')
     parser.add_argument('--skip-eval', action='store_true')
     args = parser.parse_args()
@@ -264,6 +274,95 @@ def scan(args):
     return registry
 
 
+@torch.no_grad()
+def scan_frozen(args):
+    """Compute only the 69 submitted weighted-SVD factors at their final ranks."""
+    frozen = load_frozen_manifest(args)
+    ranks = {name:row['rank'] for name,row in frozen['ranks'].items()}
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=MODEL_REVISION)
+    batches, blocks = train_samples(tokenizer, args)
+    settings = dict(model=args.model,
+                    revision=AutoConfig.from_pretrained(args.model, revision=MODEL_REVISION)._commit_hash,
+                    samples=args.samples, holdout_samples=args.holdout_samples, seqlen=args.seqlen,
+                    seed=args.seed, blocks=blocks, damp=args.damp, min_rank=args.min_rank,
+                    rank_step=args.rank_step, max_layers=args.max_layers,
+                    implementation='weighted-svd-v1')
+    allocation_hash = hashlib.sha256(json.dumps(ranks, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps(dict(settings=settings, allocation=allocation_hash),
+                                               sort_keys=True).encode()).hexdigest()
+    basis_dir = args.work_dir/'basis'
+    basis_dir.mkdir(parents=True, exist_ok=True)
+    registry_path = args.work_dir/'frozen_scan.json'
+    expected_paths = [basis_dir/f'{name}.pt' for name in ranks]
+    if registry_path.exists() and not args.rebuild and all(path.exists() for path in expected_paths):
+        registry = json.loads(registry_path.read_text())
+        if registry.get('fingerprint') == fingerprint:
+            log('[frozen] reusing completed fixed-rank SVD scan')
+            return registry
+    model = AutoModelForCausalLM.from_pretrained(args.model, revision=settings['revision'],
+                                                dtype=torch.float16, device_map={'': args.device})
+    model.eval().requires_grad_(False)
+    model.config.use_cache = False
+    specs = target_linear_specs(model)
+    hidden, kwargs = capture_first_inputs(model, batches[:args.samples])
+    del batches
+    for index, layer in enumerate(model.model.layers):
+        started = time.monotonic()
+        modules = {name:module for name,module in layer.named_modules()
+                   if isinstance(module, torch.nn.Linear)}
+        targets = {name:module for name,module in modules.items()
+                   if f'model.layers.{index}.{name}' in ranks}
+        paths = {name:basis_dir/f'model.layers.{index}.{name}.pt' for name in targets}
+        missing = [name for name in targets if args.rebuild or not paths[name].exists()]
+        grams, handles = {}, []
+
+        def family(name):
+            suffix = name.rsplit('.', 1)[-1]
+            return 'mlp_input' if suffix in ('gate_proj', 'up_proj') else name
+
+        for name in missing:
+            key = family(name)
+            if key in grams:
+                continue
+            grams[key] = torch.zeros((targets[name].in_features, targets[name].in_features),
+                                     device=args.device, dtype=torch.float32)
+
+            def collect(module, inputs, key=key):
+                value = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).float()
+                grams[key].addmm_(value.T, value, beta=1,
+                                  alpha=1/(args.samples*args.seqlen))
+
+            handles.append(targets[name].register_forward_pre_hook(collect))
+        next_hidden = []
+        try:
+            for value in hidden:
+                next_hidden.append(layer(value, **kwargs).detach())
+        finally:
+            for handle in handles:
+                handle.remove()
+        for name in missing:
+            full_name = f'model.layers.{index}.{name}'
+            rank = ranks[full_name]
+            left, right, spectrum = weighted_svd_basis(targets[name].weight, grams[family(name)],
+                                                       args.damp, rank)
+            row = dict(frozen['ranks'][full_name])
+            torch.save(dict(left=left.cpu(), right=right.cpu(), spectrum=spectrum.cpu(), rows=[row]),
+                       paths[name])
+            del left, right, spectrum
+        hidden = next_hidden
+        del next_hidden, grams
+        gc.collect()
+        torch.cuda.empty_cache()
+        log(f'[frozen] SVD layer {index+1}/36 built ({time.monotonic()-started:.1f}s)')
+    registry = dict(settings=settings, fingerprint=fingerprint, original_specs=specs,
+                    rows=list(frozen['ranks'].values()), allocation_mode='frozen')
+    registry_path.write_text(json.dumps(registry, indent=2))
+    del model, hidden, kwargs, modules, targets
+    gc.collect()
+    torch.cuda.empty_cache()
+    return registry
+
+
 def convex_options(rows):
     """Lower convex envelope of loss versus bytes saved, including the dense option."""
     points = [dict(rank=0, error=0.0, saved_bytes=0)]+sorted(rows, key=lambda r: r['saved_bytes'])
@@ -379,10 +478,45 @@ def quantize_to_budget(model, specs, args, target_bytes):
 
 
 @torch.no_grad()
+def apply_frozen_int8_rows(model, specs, frozen):
+    """Apply the submitted INT8/FP16 row allocation without rescoring components."""
+    assigned = frozen['quantization']['rows']
+    for name in specs:
+        if name == 'lm_head':
+            continue
+        module = model.get_submodule(name)
+        pieces = [(name, module)]
+        if isinstance(module, LowRankLinear):
+            pieces = [(name+'.right', module.right), (name+'.left', module.left)]
+        for component_name, piece in pieces:
+            rows = assigned.get(component_name, 0)
+            if not rows:
+                continue
+            if rows > piece.out_features:
+                raise AssertionError(f'Frozen INT8 row count exceeds {component_name}')
+            qweight, scales = int8_candidate(piece.weight16)
+            set_module(model, component_name, apply_int8_rows(piece, qweight, scales, rows))
+    after = target_payload(model, specs)
+    if after != frozen['compressed_linear_bytes']:
+        raise AssertionError(f"Frozen Case 3 payload changed: {after} != {frozen['compressed_linear_bytes']}")
+    quantization = dict(frozen['quantization'])
+    quantization['allocation_mode'] = 'frozen'
+    return quantization
+
+
+@torch.no_grad()
 def build(args, registry):
+    # Search and frozen allocation take different paths before the shared
+    # checkpoint-reload cleanup.
+    module = original = layer = None
     output_dir = checkpoint_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
-    chosen, saving = select_ranks(registry, args)
+    frozen = None if args.search else load_frozen_manifest(args)
+    if frozen is None:
+        chosen, saving = select_ranks(registry, args)
+    else:
+        chosen = frozen['ranks']
+        saving = sum(row['saved_bytes'] for row in chosen.values())
     specs = registry['original_specs']
     before = original_bytes(specs)
     model = AutoModelForCausalLM.from_pretrained(args.model, revision=registry['settings']['revision'],
@@ -403,24 +537,32 @@ def build(args, registry):
     svd_bytes = target_payload(model, specs)
     if svd_bytes != before-saving:
         raise AssertionError('SVD size does not match factor parameter count')
+    if frozen is not None and svd_bytes != frozen['svd_linear_bytes']:
+        raise AssertionError(f"Frozen SVD payload changed: {svd_bytes} != {frozen['svd_linear_bytes']}")
     quantization = None
     if args.mode == 'mixed':
-        exact_target = Fraction(before)*(1-Fraction(args.overall_rate))
-        if exact_target.denominator != 1:
-            raise ValueError('Requested exact compression is not representable in whole bytes')
-        quantization = quantize_to_budget(model, specs, args, int(exact_target))
+        if frozen is not None:
+            quantization = apply_frozen_int8_rows(model, specs, frozen)
+        else:
+            exact_target = Fraction(before)*(1-Fraction(args.overall_rate))
+            if exact_target.denominator != 1:
+                raise ValueError('Requested exact compression is not representable in whole bytes')
+            quantization = quantize_to_budget(model, specs, args, int(exact_target))
     after = target_payload(model, specs)
     log(f'[storage] SVD={1-svd_bytes/before:.6%}; overall={1-after/before:.9%}, {after:,} bytes')
-    block_errors = {}
-    for index, layer in enumerate(model.model.layers):
-        path = args.work_dir/'blocks'/f'layer{index}.pt'
-        if not path.exists():
-            continue
-        holdout = device_tree(torch.load(path, map_location='cpu', weights_only=True), args.device)
-        error = block_error(layer, holdout['inputs'], holdout['references'], holdout['kwargs'])
-        block_errors[index] = error
-        log(f'[joint-block] {index}: normalized error={error:.6g}')
-        del holdout
+    if frozen is None:
+        block_errors = {}
+        for index, layer in enumerate(model.model.layers):
+            path = args.work_dir/'blocks'/f'layer{index}.pt'
+            if not path.exists():
+                continue
+            holdout = device_tree(torch.load(path, map_location='cpu', weights_only=True), args.device)
+            error = block_error(layer, holdout['inputs'], holdout['references'], holdout['kwargs'])
+            block_errors[index] = error
+            log(f'[joint-block] {index}: normalized error={error:.6g}')
+            del holdout
+    else:
+        block_errors = frozen['joint_block_errors']
     formats = {name: (dict(kind='dense', **specs[name]) if name == 'lm_head'
                       else model.get_submodule(name).spec()) for name in specs}
     manifest = dict(model=args.model, mode=args.mode, calibration=registry['settings'], original_specs=specs,
@@ -428,7 +570,9 @@ def build(args, registry):
                     svd_compression_rate=1-svd_bytes/before, compressed_linear_bytes=after,
                     compression_rate=1-after/before, exact_half=2*after == before,
                     ranks=chosen, formats=formats, quantization=quantization,
-                    joint_block_errors=block_errors, **accounting_metadata(specs))
+                    joint_block_errors=block_errors, **accounting_metadata(specs),
+                    allocation_mode='search' if args.search else 'frozen',
+                    frozen_source=FROZEN_MANIFEST.name if frozen is not None else None)
     state = {key: value.detach().cpu().contiguous() for key, value in model.state_dict().items()
              if key != 'model.embed_tokens.weight'}
     checkpoint = output_dir/'model.safetensors'
@@ -559,10 +703,13 @@ def main():
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    if not args.search and not args.eval_only and (args.mode != 'mixed' or args.max_layers is not None or
+                                                   args.overall_rate != '0.5'):
+        raise ValueError('Frozen Case 3 supports the submitted exact-50% mixed mode only; use --search for custom experiments')
     if args.eval_only:
         model = load_checkpoint(args)
     else:
-        registry = scan(args)
+        registry = scan(args) if args.search else scan_frozen(args)
         model = build(args, registry)
     if not args.skip_eval:
         run_official_evaluation(model, args)
